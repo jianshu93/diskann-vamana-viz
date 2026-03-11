@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.build_beam_width,
     );
 
-    let query_fig_path = cfg.out_dir.join("final_graph_query_trace_top1.svg");
+    let query_fig_path = cfg.out_dir.join("final_graph_query_trace.svg");
     render_single_snapshot_with_trace(
         &query_fig_path,
         &points,

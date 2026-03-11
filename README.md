@@ -1,4 +1,4 @@
-# diskann-vamana-viz-top1
+# diskann-vamana-viz
 
 A small Rust crate for visualizing a sequential debug Vamana-style build on 2D random points.
 
@@ -32,7 +32,7 @@ cargo run --release -- \
 
 - `frame_01.svg` ... `frame_08.svg`
 - `figure1_overview.svg`
-- `final_graph_query_trace_top1.svg`
+- `final_graph_query_trace.svg`
 
 ## Notes
 
