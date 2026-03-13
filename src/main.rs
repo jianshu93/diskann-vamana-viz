@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const GRAPH_SLACK_FACTOR: f64 = 1.3;
+
 #[derive(Clone, Copy, Debug)]
 struct Point2 {
     x: f64,
@@ -111,11 +113,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         &summary_path,
         format!(
-            "diskann-vamana-viz-top1\n\
-             =======================\n\n\
+            "diskann-vamana-viz\n\
+             =================\n\n\
              This folder contains 8 snapshot SVG files, one combined overview,\n\
-             and one final-graph query-trace figure that highlights only the\n\
-             top-1 nearest neighbor among the final beam results.\n\n\
+             and one final-graph query-trace figure aligned to the updated\n\
+             practical rust-diskann incremental build.\n\n\
              Parameters\n\
              ----------\n\
              n_points         = {}\n\
@@ -130,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              -----\n\
              frame_01.svg ... frame_08.svg\n\
              figure1_overview.svg\n\
-             final_graph_query_trace_top1.svg\n",
+             final_graph_query_trace.svg\n",
             cfg.n_points,
             cfg.max_degree,
             cfg.build_beam_width,
@@ -156,14 +158,59 @@ fn parse_args() -> Config {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--n" => cfg.n_points = args.next().expect("missing value after --n").parse().expect("invalid --n"),
-            "--max-degree" => cfg.max_degree = args.next().expect("missing value after --max-degree").parse().expect("invalid --max-degree"),
-            "--beam" => cfg.build_beam_width = args.next().expect("missing value after --beam").parse().expect("invalid --beam"),
-            "--alpha" => cfg.alpha = args.next().expect("missing value after --alpha").parse().expect("invalid --alpha"),
-            "--passes" => cfg.passes = args.next().expect("missing value after --passes").parse().expect("invalid --passes"),
-            "--extra-seeds" => cfg.extra_seeds = args.next().expect("missing value after --extra-seeds").parse().expect("invalid --extra-seeds"),
-            "--seed" => cfg.seed = args.next().expect("missing value after --seed").parse().expect("invalid --seed"),
-            "--out-dir" => cfg.out_dir = PathBuf::from(args.next().expect("missing value after --out-dir")),
+            "--n" => {
+                cfg.n_points = args
+                    .next()
+                    .expect("missing value after --n")
+                    .parse()
+                    .expect("invalid --n")
+            }
+            "--max-degree" => {
+                cfg.max_degree = args
+                    .next()
+                    .expect("missing value after --max-degree")
+                    .parse()
+                    .expect("invalid --max-degree")
+            }
+            "--beam" => {
+                cfg.build_beam_width = args
+                    .next()
+                    .expect("missing value after --beam")
+                    .parse()
+                    .expect("invalid --beam")
+            }
+            "--alpha" => {
+                cfg.alpha = args
+                    .next()
+                    .expect("missing value after --alpha")
+                    .parse()
+                    .expect("invalid --alpha")
+            }
+            "--passes" => {
+                cfg.passes = args
+                    .next()
+                    .expect("missing value after --passes")
+                    .parse()
+                    .expect("invalid --passes")
+            }
+            "--extra-seeds" => {
+                cfg.extra_seeds = args
+                    .next()
+                    .expect("missing value after --extra-seeds")
+                    .parse()
+                    .expect("invalid --extra-seeds")
+            }
+            "--seed" => {
+                cfg.seed = args
+                    .next()
+                    .expect("missing value after --seed")
+                    .parse()
+                    .expect("invalid --seed")
+            }
+            "--out-dir" => {
+                cfg.out_dir =
+                    PathBuf::from(args.next().expect("missing value after --out-dir"))
+            }
             "-h" | "--help" => {
                 print_help_and_exit();
             }
@@ -253,19 +300,34 @@ fn bootstrap_random_graph(n: usize, max_degree: usize, rng: &mut StdRng) -> Vec<
     graph
 }
 
+fn snapshot_targets(total_steps: usize, count: usize) -> Vec<usize> {
+    (1..=count)
+        .map(|i| {
+            let raw = ((i as f64) * (total_steps as f64) / (count as f64)).ceil() as usize;
+            raw.clamp(1, total_steps)
+        })
+        .collect()
+}
+
+/// Updated to match your new rust-diskann build:
+/// - incremental node refinement
+/// - immediate reverse insertion with slack
+/// - no pass-end symmetrize/reprune
 fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) -> Vec<Snapshot> {
     let n = points.len();
-    let total_refinements = n * cfg.passes.max(1);
+    let passes = cfg.passes.max(1);
+    let total_refinements = n * passes;
     let target_steps = snapshot_targets(total_refinements, 8);
 
     let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0xDEADBEEFCAFEBABE);
     let mut graph = bootstrap_random_graph(n, cfg.max_degree, &mut rng);
+
     let mut snapshots = Vec::<Snapshot>::new();
     let mut refined_count = 0usize;
     let mut next_target_idx = 0usize;
 
-    for pass_idx in 0..cfg.passes.max(1) {
-        let pass_alpha = if cfg.passes.max(1) == 1 {
+    for pass_idx in 0..passes {
+        let pass_alpha = if passes == 1 {
             cfg.alpha
         } else if pass_idx == 0 {
             1.0
@@ -279,6 +341,7 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
         for &u in &order {
             let mut candidates = Vec::<(usize, f64)>::new();
 
+            // include current adjacency as cheap prior
             for &nb in &graph[u] {
                 candidates.push((nb, l2(points[u], points[nb])));
             }
@@ -302,10 +365,26 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
                 candidates.extend(visited);
             }
 
-            graph[u] = prune_neighbors(u, &candidates, points, cfg.max_degree, pass_alpha);
+            let pruned = prune_neighbors(u, &candidates, points, cfg.max_degree, pass_alpha);
+
+            // set u outgoing
+            graph[u] = pruned.clone();
+
+            // reverse insertion with slack-triggered local reprune
+            inter_insert_with_slack(
+                &mut graph,
+                u,
+                &pruned,
+                points,
+                cfg.max_degree,
+                pass_alpha,
+            );
+
             refined_count += 1;
 
-            while next_target_idx < target_steps.len() && refined_count >= target_steps[next_target_idx] {
+            while next_target_idx < target_steps.len()
+                && refined_count >= target_steps[next_target_idx]
+            {
                 snapshots.push(Snapshot {
                     step: refined_count,
                     total_steps: total_refinements,
@@ -321,30 +400,22 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
                 next_target_idx += 1;
             }
         }
-
-        graph = symmetrize_and_reprune(&graph, points, cfg.max_degree, pass_alpha);
     }
 
     while snapshots.len() < 8 {
         snapshots.push(Snapshot {
             step: total_refinements,
             total_steps: total_refinements,
-            title: "100.0% refined".to_string(),
+            title: format!(
+                "100.0% refined (pass {}, step {}/{})",
+                passes, total_refinements, total_refinements
+            ),
             graph: graph.clone(),
         });
     }
 
     snapshots.truncate(8);
     snapshots
-}
-
-fn snapshot_targets(total_steps: usize, count: usize) -> Vec<usize> {
-    (1..=count)
-        .map(|i| {
-            let raw = ((i as f64) * (total_steps as f64) / (count as f64)).ceil() as usize;
-            raw.clamp(1, total_steps)
-        })
-        .collect()
 }
 
 fn greedy_search_visited_collect(
@@ -476,6 +547,10 @@ fn search_with_trace(
     }
 }
 
+/// Updated to match your new prune logic:
+/// - dedup by keeping nearest occurrence
+/// - no backfill of rejected candidates
+/// - return possibly fewer than max_degree
 fn prune_neighbors(
     node_id: usize,
     candidates: &[(usize, f64)],
@@ -483,49 +558,41 @@ fn prune_neighbors(
     max_degree: usize,
     alpha: f64,
 ) -> Vec<usize> {
-    if candidates.is_empty() {
+    if candidates.is_empty() || max_degree == 0 {
         return Vec::new();
     }
 
-    let mut best_by_id = HashMap::<usize, f64>::new();
-    for &(cand_id, cand_dist) in candidates {
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+    let mut uniq = Vec::<(usize, f64)>::with_capacity(sorted.len());
+    let mut last_id: Option<usize> = None;
+
+    for &(cand_id, cand_dist) in &sorted {
         if cand_id == node_id {
             continue;
         }
-        best_by_id
-            .entry(cand_id)
-            .and_modify(|d| {
-                if cand_dist < *d {
-                    *d = cand_dist;
-                }
-            })
-            .or_insert(cand_dist);
+        if last_id == Some(cand_id) {
+            continue;
+        }
+        uniq.push((cand_id, cand_dist));
+        last_id = Some(cand_id);
     }
 
-    let mut sorted: Vec<(usize, f64)> = best_by_id.into_iter().collect();
-    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut pruned = Vec::<usize>::with_capacity(max_degree);
 
-    let mut pruned = Vec::<usize>::new();
+    for &(cand_id, cand_dist_to_node) in &uniq {
+        let mut occluded = false;
 
-    for &(cand_id, cand_dist) in &sorted {
-        let mut ok = true;
-        for &sel in &pruned {
-            let d = l2(points[cand_id], points[sel]);
-            if alpha * d <= cand_dist {
-                ok = false;
+        for &sel_id in &pruned {
+            let d_cand_sel = l2(points[cand_id], points[sel_id]);
+            if alpha * d_cand_sel <= cand_dist_to_node {
+                occluded = true;
                 break;
             }
         }
-        if ok {
-            pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                return pruned;
-            }
-        }
-    }
 
-    for &(cand_id, _) in &sorted {
-        if !pruned.contains(&cand_id) {
+        if !occluded {
             pruned.push(cand_id);
             if pruned.len() >= max_degree {
                 break;
@@ -536,38 +603,44 @@ fn prune_neighbors(
     pruned
 }
 
-fn symmetrize_and_reprune(
-    graph: &[Vec<usize>],
+fn inter_insert_with_slack(
+    graph: &mut [Vec<usize>],
+    src: usize,
+    pruned_list: &[usize],
     points: &[Point2],
     max_degree: usize,
     alpha: f64,
-) -> Vec<Vec<usize>> {
-    let n = graph.len();
-    let mut incoming = vec![Vec::<usize>::new(); n];
-    for (u, nbrs) in graph.iter().enumerate() {
-        for &v in nbrs {
-            if v != u {
-                incoming[v].push(u);
-            }
-        }
-    }
+) {
+    let slack_limit =
+        ((GRAPH_SLACK_FACTOR * max_degree as f64).ceil() as usize).max(max_degree);
 
-    let mut new_graph = vec![Vec::<usize>::new(); n];
-    for u in 0..n {
-        let mut ids = graph[u].clone();
-        ids.extend_from_slice(&incoming[u]);
+    for &dst in pruned_list {
+        if dst == src {
+            continue;
+        }
+
+        if graph[dst].contains(&src) {
+            continue;
+        }
+
+        if graph[dst].len() < slack_limit {
+            graph[dst].push(src);
+            continue;
+        }
+
+        let mut ids = graph[dst].clone();
+        ids.push(src);
         ids.sort_unstable();
         ids.dedup();
-        ids.retain(|&v| v != u);
 
-        let candidates: Vec<(usize, f64)> = ids
+        let pool: Vec<(usize, f64)> = ids
             .into_iter()
-            .map(|v| (v, l2(points[u], points[v])))
+            .filter(|&id| id != dst)
+            .map(|id| (id, l2(points[dst], points[id])))
             .collect();
-        new_graph[u] = prune_neighbors(u, &candidates, points, max_degree, alpha);
-    }
 
-    new_graph
+        graph[dst] = prune_neighbors(dst, &pool, points, max_degree, alpha);
+    }
 }
 
 fn undirected_edges(graph: &[Vec<usize>]) -> Vec<(usize, usize)> {
@@ -634,6 +707,7 @@ fn backtrack_path_to_top1(
 
     path
 }
+
 fn draw_path_to_top1<DB: DrawingBackend>(
     chart: &mut ChartContext<
         '_,
