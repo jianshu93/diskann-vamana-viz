@@ -116,8 +116,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "diskann-vamana-viz\n\
              =================\n\n\
              This folder contains 8 snapshot SVG files, one combined overview,\n\
-             and one final-graph query-trace figure aligned to the updated\n\
-             practical rust-diskann incremental build.\n\n\
+             and one final-graph query-trace figure.\n\n\
+             NOTE\n\
+             ----\n\
+             This visualization intentionally uses a single-threaded incremental\n\
+             build for clarity. It matches the current rust-diskann pruning logic:\n\
+             - greedy candidate collection\n\
+             - robust alpha-pruning\n\
+             - nearest-neighbor backfill\n\
+             - reverse insertion with slack-triggered local reprune\n\n\
              Parameters\n\
              ----------\n\
              n_points         = {}\n\
@@ -208,8 +215,7 @@ fn parse_args() -> Config {
                     .expect("invalid --seed")
             }
             "--out-dir" => {
-                cfg.out_dir =
-                    PathBuf::from(args.next().expect("missing value after --out-dir"))
+                cfg.out_dir = PathBuf::from(args.next().expect("missing value after --out-dir"))
             }
             "-h" | "--help" => {
                 print_help_and_exit();
@@ -309,10 +315,15 @@ fn snapshot_targets(total_steps: usize, count: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Updated to match your new rust-diskann build:
-/// - incremental node refinement
-/// - immediate reverse insertion with slack
-/// - no pass-end symmetrize/reprune
+/// Single-threaded incremental visualization:
+/// - random bootstrap graph
+/// - per-node greedy candidate collection
+/// - medoid + extra random seeds
+/// - robust alpha-pruning with nearest-neighbor backfill
+/// - reverse insertion with slack-triggered local reprune
+///
+/// This is intentionally slower and simpler than the real chunked build,
+/// but it now matches the current pruning logic in rust-diskann.
 fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) -> Vec<Snapshot> {
     let n = points.len();
     let passes = cfg.passes.max(1);
@@ -339,13 +350,16 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
         order.shuffle(&mut rng);
 
         for &u in &order {
+            let snapshot = graph.clone();
+
             let mut candidates = Vec::<(usize, f64)>::new();
 
-            // include current adjacency as cheap prior
-            for &nb in &graph[u] {
+            // Start from current adjacency.
+            for &nb in &snapshot[u] {
                 candidates.push((nb, l2(points[u], points[nb])));
             }
 
+            // Seed list: medoid + distinct random starts.
             let mut seeds = vec![medoid];
             while seeds.len() < 1 + cfg.extra_seeds {
                 let s = rng.gen_range(0..n);
@@ -357,7 +371,7 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
             for &start in &seeds {
                 let visited = greedy_search_visited_collect(
                     points,
-                    &graph,
+                    &snapshot,
                     points[u],
                     start,
                     cfg.build_beam_width,
@@ -365,12 +379,14 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
                 candidates.extend(visited);
             }
 
+            dedup_keep_best_by_id_in_place_vis(&mut candidates);
+
             let pruned = prune_neighbors(u, &candidates, points, cfg.max_degree, pass_alpha);
 
-            // set u outgoing
+            // Set u outgoing.
             graph[u] = pruned.clone();
 
-            // reverse insertion with slack-triggered local reprune
+            // Incremental reverse insertion with slack-triggered local reprune.
             inter_insert_with_slack(
                 &mut graph,
                 u,
@@ -458,7 +474,7 @@ fn greedy_search_visited_collect(
                 let current_worst = work
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                    .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
                     .map(|(idx, item)| (idx, item.1))
                     .unwrap();
                 if d < current_worst.1 {
@@ -522,7 +538,7 @@ fn search_with_trace(
                 let current_worst = work
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                    .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
                     .map(|(idx, item)| (idx, item.1))
                     .unwrap();
 
@@ -547,10 +563,28 @@ fn search_with_trace(
     }
 }
 
-/// Updated to match your new prune logic:
-/// - dedup by keeping nearest occurrence
-/// - no backfill of rejected candidates
-/// - return possibly fewer than max_degree
+fn dedup_keep_best_by_id_in_place_vis(cands: &mut Vec<(usize, f64)>) {
+    if cands.is_empty() {
+        return;
+    }
+
+    cands.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.total_cmp(&b.1))
+    });
+
+    let mut write = 0usize;
+    for read in 0..cands.len() {
+        if write == 0 || cands[read].0 != cands[write - 1].0 {
+            cands[write] = cands[read];
+            write += 1;
+        }
+    }
+    cands.truncate(write);
+}
+
+/// alpha-pruning with nearest-neighbor backfill.
+/// This matches your current rust-diskann pruning logic.
 fn prune_neighbors(
     node_id: usize,
     candidates: &[(usize, f64)],
@@ -579,8 +613,13 @@ fn prune_neighbors(
         last_id = Some(cand_id);
     }
 
+    if uniq.is_empty() {
+        return Vec::new();
+    }
+
     let mut pruned = Vec::<usize>::with_capacity(max_degree);
 
+    // Phase 1: robust alpha-pruning
     for &(cand_id, cand_dist_to_node) in &uniq {
         let mut occluded = false;
 
@@ -593,6 +632,19 @@ fn prune_neighbors(
         }
 
         if !occluded {
+            pruned.push(cand_id);
+            if pruned.len() >= max_degree {
+                return pruned;
+            }
+        }
+    }
+
+    // Phase 2: nearest-neighbor backfill
+    if pruned.len() < max_degree {
+        for &(cand_id, _) in &uniq {
+            if pruned.contains(&cand_id) {
+                continue;
+            }
             pruned.push(cand_id);
             if pruned.len() >= max_degree {
                 break;
