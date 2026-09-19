@@ -22,7 +22,6 @@ cargo run --release -- \
   --max-degree 8 \
   --beam 16 \
   --alpha 1.2 \
-  --passes 2 \
   --extra-seeds 2 \
   --seed 7 \
   --out-dir output
@@ -36,4 +35,4 @@ cargo run --release -- \
 
 ## Notes
 
-This is a sequential visualization crate. It is Vamana-style, but it is not intended to be a byte-for-byte reproduction of the production `rust-diskann` builder, which is fully parallelized and optimized.
+This is a sequential visualization crate. It uses the same progressive RobustPrune semantics as `rust-diskann`: alpha relaxation starts at 1.0 inside each prune and the candidate pool is capped at 750. It is not intended to reproduce the production builder's parallel scheduling.

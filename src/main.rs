@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const GRAPH_SLACK_FACTOR: f64 = 1.3;
+const MAX_OCCLUSION_SIZE: usize = 750;
 
 #[derive(Clone, Copy, Debug)]
 struct Point2 {
@@ -36,7 +37,6 @@ struct Config {
     max_degree: usize,
     build_beam_width: usize,
     alpha: f64,
-    passes: usize,
     extra_seeds: usize,
     seed: u64,
     out_dir: PathBuf,
@@ -49,7 +49,6 @@ impl Default for Config {
             max_degree: 8,
             build_beam_width: 16,
             alpha: 1.2,
-            passes: 2,
             extra_seeds: 2,
             seed: 7,
             out_dir: PathBuf::from("output"),
@@ -70,7 +69,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  max_degree       = {}", cfg.max_degree);
     println!("  build_beam_width = {}", cfg.build_beam_width);
     println!("  alpha            = {:.3}", cfg.alpha);
-    println!("  passes           = {}", cfg.passes);
     println!("  extra_seeds      = {}", cfg.extra_seeds);
     println!("  seed             = {}", cfg.seed);
     println!("  medoid           = {}", medoid);
@@ -101,13 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let query_fig_path = cfg.out_dir.join("final_graph_query_trace.svg");
-    render_single_snapshot_with_trace(
-        &query_fig_path,
-        &points,
-        medoid,
-        &final_snap,
-        &trace,
-    )?;
+    render_single_snapshot_with_trace(&query_fig_path, &points, medoid, &final_snap, &trace)?;
 
     let summary_path = cfg.out_dir.join("README.txt");
     fs::write(
@@ -122,8 +114,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              This visualization intentionally uses a single-threaded incremental\n\
              build for clarity. It matches the current rust-diskann pruning logic:\n\
              - greedy candidate collection\n\
-             - robust alpha-pruning\n\
-             - nearest-neighbor backfill\n\
+             - progressive RobustPrune from alpha 1.0 to the configured alpha\n\
+             - candidate-pool cap of 750\n\
              - reverse insertion with slack-triggered local reprune\n\n\
              Parameters\n\
              ----------\n\
@@ -131,7 +123,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              max_degree       = {}\n\
              build_beam_width = {}\n\
              alpha            = {:.3}\n\
-             passes           = {}\n\
              extra_seeds      = {}\n\
              seed             = {}\n\
              medoid           = {}\n\n\
@@ -144,7 +135,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.max_degree,
             cfg.build_beam_width,
             cfg.alpha,
-            cfg.passes,
             cfg.extra_seeds,
             cfg.seed,
             medoid,
@@ -157,6 +147,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Per-frame SVGs  : {}/frame_XX.svg", cfg.out_dir.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progressive_alpha_reconsiders_occluded_candidates() {
+        let points = vec![
+            Point2 { x: 0.0, y: 0.0 },
+            Point2 { x: 1.0, y: 0.0 },
+            Point2 { x: 0.65, y: 0.886 },
+        ];
+        let candidates = vec![(1, l2(points[0], points[1])), (2, l2(points[0], points[2]))];
+
+        assert_eq!(prune_neighbors(0, &candidates, &points, 2, 1.0), vec![1]);
+        assert_eq!(prune_neighbors(0, &candidates, &points, 2, 1.2), vec![1, 2]);
+    }
 }
 
 fn parse_args() -> Config {
@@ -192,13 +200,6 @@ fn parse_args() -> Config {
                     .expect("missing value after --alpha")
                     .parse()
                     .expect("invalid --alpha")
-            }
-            "--passes" => {
-                cfg.passes = args
-                    .next()
-                    .expect("missing value after --passes")
-                    .parse()
-                    .expect("invalid --passes")
             }
             "--extra-seeds" => {
                 cfg.extra_seeds = args
@@ -239,7 +240,6 @@ fn print_help_and_exit() -> ! {
            --max-degree <int>     Out-degree cap M (default: 8)\n\
            --beam <int>           Build beam width L (default: 16)\n\
            --alpha <float>        Alpha for pruning (default: 1.2)\n\
-           --passes <int>         Number of refinement passes (default: 2)\n\
            --extra-seeds <int>    Extra random greedy-search starts (default: 2)\n\
            --seed <int>           RNG seed (default: 7)\n\
            --out-dir <path>       Output directory (default: output)\n"
@@ -319,15 +319,14 @@ fn snapshot_targets(total_steps: usize, count: usize) -> Vec<usize> {
 /// - random bootstrap graph
 /// - per-node greedy candidate collection
 /// - medoid + extra random seeds
-/// - robust alpha-pruning with nearest-neighbor backfill
+/// - progressive RobustPrune with a bounded candidate pool
 /// - reverse insertion with slack-triggered local reprune
 ///
 /// This is intentionally slower and simpler than the real chunked build,
 /// but it now matches the current pruning logic in rust-diskann.
 fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) -> Vec<Snapshot> {
     let n = points.len();
-    let passes = cfg.passes.max(1);
-    let total_refinements = n * passes;
+    let total_refinements = n;
     let target_steps = snapshot_targets(total_refinements, 8);
 
     let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0xDEADBEEFCAFEBABE);
@@ -337,84 +336,65 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
     let mut refined_count = 0usize;
     let mut next_target_idx = 0usize;
 
-    for pass_idx in 0..passes {
-        let pass_alpha = if passes == 1 {
-            cfg.alpha
-        } else if pass_idx == 0 {
-            1.0
-        } else {
-            cfg.alpha
-        };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.shuffle(&mut rng);
 
-        let mut order: Vec<usize> = (0..n).collect();
-        order.shuffle(&mut rng);
+    for &u in &order {
+        let snapshot = graph.clone();
 
-        for &u in &order {
-            let snapshot = graph.clone();
+        let mut candidates = Vec::<(usize, f64)>::new();
 
-            let mut candidates = Vec::<(usize, f64)>::new();
+        // Start from current adjacency.
+        for &nb in &snapshot[u] {
+            candidates.push((nb, l2(points[u], points[nb])));
+        }
 
-            // Start from current adjacency.
-            for &nb in &snapshot[u] {
-                candidates.push((nb, l2(points[u], points[nb])));
+        // Seed list: medoid + distinct random starts.
+        let mut seeds = vec![medoid];
+        while seeds.len() < 1 + cfg.extra_seeds {
+            let s = rng.gen_range(0..n);
+            if !seeds.contains(&s) {
+                seeds.push(s);
             }
+        }
 
-            // Seed list: medoid + distinct random starts.
-            let mut seeds = vec![medoid];
-            while seeds.len() < 1 + cfg.extra_seeds {
-                let s = rng.gen_range(0..n);
-                if !seeds.contains(&s) {
-                    seeds.push(s);
-                }
-            }
-
-            for &start in &seeds {
-                let visited = greedy_search_visited_collect(
-                    points,
-                    &snapshot,
-                    points[u],
-                    start,
-                    cfg.build_beam_width,
-                );
-                candidates.extend(visited);
-            }
-
-            dedup_keep_best_by_id_in_place_vis(&mut candidates);
-
-            let pruned = prune_neighbors(u, &candidates, points, cfg.max_degree, pass_alpha);
-
-            // Set u outgoing.
-            graph[u] = pruned.clone();
-
-            // Incremental reverse insertion with slack-triggered local reprune.
-            inter_insert_with_slack(
-                &mut graph,
-                u,
-                &pruned,
+        for &start in &seeds {
+            let visited = greedy_search_visited_collect(
                 points,
-                cfg.max_degree,
-                pass_alpha,
+                &snapshot,
+                points[u],
+                start,
+                cfg.build_beam_width,
             );
+            candidates.extend(visited);
+        }
 
-            refined_count += 1;
+        dedup_keep_best_by_id_in_place_vis(&mut candidates);
 
-            while next_target_idx < target_steps.len()
-                && refined_count >= target_steps[next_target_idx]
-            {
-                snapshots.push(Snapshot {
-                    step: refined_count,
-                    total_steps: total_refinements,
-                    title: format!(
-                        "{:.1}% refined (pass {}, step {}/{})",
-                        100.0 * refined_count as f64 / total_refinements as f64,
-                        pass_idx + 1,
-                        refined_count,
-                        total_refinements
-                    ),
-                    graph: graph.clone(),
-                });
-                next_target_idx += 1;
-            }
+        let pruned = prune_neighbors(u, &candidates, points, cfg.max_degree, cfg.alpha);
+
+        // Set u outgoing.
+        graph[u] = pruned.clone();
+
+        // Incremental reverse insertion with slack-triggered local reprune.
+        inter_insert_with_slack(&mut graph, u, &pruned, points, cfg.max_degree, cfg.alpha);
+
+        refined_count += 1;
+
+        while next_target_idx < target_steps.len() && refined_count >= target_steps[next_target_idx]
+        {
+            snapshots.push(Snapshot {
+                step: refined_count,
+                total_steps: total_refinements,
+                title: format!(
+                    "{:.1}% refined (step {}/{})",
+                    100.0 * refined_count as f64 / total_refinements as f64,
+                    refined_count,
+                    total_refinements
+                ),
+                graph: graph.clone(),
+            });
+            next_target_idx += 1;
         }
     }
 
@@ -423,8 +403,8 @@ fn build_vamana_debug_snapshots(points: &[Point2], medoid: usize, cfg: &Config) 
             step: total_refinements,
             total_steps: total_refinements,
             title: format!(
-                "100.0% refined (pass {}, step {}/{})",
-                passes, total_refinements, total_refinements
+                "100.0% refined (step {}/{})",
+                total_refinements, total_refinements
             ),
             graph: graph.clone(),
         });
@@ -474,7 +454,7 @@ fn greedy_search_visited_collect(
                 let current_worst = work
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
+                    .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
                     .map(|(idx, item)| (idx, item.1))
                     .unwrap();
                 if d < current_worst.1 {
@@ -538,7 +518,7 @@ fn search_with_trace(
                 let current_worst = work
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.1.total_cmp(&b.1.1))
+                    .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
                     .map(|(idx, item)| (idx, item.1))
                     .unwrap();
 
@@ -568,10 +548,7 @@ fn dedup_keep_best_by_id_in_place_vis(cands: &mut Vec<(usize, f64)>) {
         return;
     }
 
-    cands.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.total_cmp(&b.1))
-    });
+    cands.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
 
     let mut write = 0usize;
     for read in 0..cands.len() {
@@ -583,8 +560,7 @@ fn dedup_keep_best_by_id_in_place_vis(cands: &mut Vec<(usize, f64)>) {
     cands.truncate(write);
 }
 
-/// alpha-pruning with nearest-neighbor backfill.
-/// This matches your current rust-diskann pruning logic.
+/// Vamana RobustPrune with progressive alpha relaxation.
 fn prune_neighbors(
     node_id: usize,
     candidates: &[(usize, f64)],
@@ -598,19 +574,16 @@ fn prune_neighbors(
 
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+    sorted.truncate(MAX_OCCLUSION_SIZE);
 
     let mut uniq = Vec::<(usize, f64)>::with_capacity(sorted.len());
-    let mut last_id: Option<usize> = None;
+    let mut seen = HashSet::with_capacity(sorted.len());
 
     for &(cand_id, cand_dist) in &sorted {
-        if cand_id == node_id {
-            continue;
-        }
-        if last_id == Some(cand_id) {
+        if cand_id == node_id || !seen.insert(cand_id) {
             continue;
         }
         uniq.push((cand_id, cand_dist));
-        last_id = Some(cand_id);
     }
 
     if uniq.is_empty() {
@@ -618,38 +591,44 @@ fn prune_neighbors(
     }
 
     let mut pruned = Vec::<usize>::with_capacity(max_degree);
+    let mut occlude_factors = vec![0.0f64; uniq.len()];
+    let target_alpha = alpha.max(1.0);
+    let increment = target_alpha.min(1.2);
+    let mut current_alpha = 1.0f64;
 
-    // Phase 1: robust alpha-pruning
-    for &(cand_id, cand_dist_to_node) in &uniq {
-        let mut occluded = false;
-
-        for &sel_id in &pruned {
-            let d_cand_sel = l2(points[cand_id], points[sel_id]);
-            if alpha * d_cand_sel <= cand_dist_to_node {
-                occluded = true;
-                break;
-            }
-        }
-
-        if !occluded {
-            pruned.push(cand_id);
+    loop {
+        for i in 0..uniq.len() {
             if pruned.len() >= max_degree {
                 return pruned;
             }
-        }
-    }
-
-    // Phase 2: nearest-neighbor backfill
-    if pruned.len() < max_degree {
-        for &(cand_id, _) in &uniq {
-            if pruned.contains(&cand_id) {
+            if occlude_factors[i] > current_alpha {
                 continue;
             }
-            pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                break;
+
+            let (selected_id, _) = uniq[i];
+            occlude_factors[i] = f64::MAX;
+            pruned.push(selected_id);
+
+            for j in (i + 1)..uniq.len() {
+                if occlude_factors[j] > target_alpha {
+                    continue;
+                }
+
+                let (candidate_id, candidate_dist) = uniq[j];
+                let pair_dist = l2(points[candidate_id], points[selected_id]);
+                let factor = if pair_dist == 0.0 {
+                    f64::MAX
+                } else {
+                    candidate_dist / pair_dist
+                };
+                occlude_factors[j] = occlude_factors[j].max(factor);
             }
         }
+
+        if current_alpha >= target_alpha {
+            break;
+        }
+        current_alpha = (current_alpha * increment).min(target_alpha);
     }
 
     pruned
@@ -663,8 +642,7 @@ fn inter_insert_with_slack(
     max_degree: usize,
     alpha: f64,
 ) {
-    let slack_limit =
-        ((GRAPH_SLACK_FACTOR * max_degree as f64).ceil() as usize).max(max_degree);
+    let slack_limit = ((GRAPH_SLACK_FACTOR * max_degree as f64).ceil() as usize).max(max_degree);
 
     for &dst in pruned_list {
         if dst == src {
@@ -764,10 +742,7 @@ fn draw_path_to_top1<DB: DrawingBackend>(
     chart: &mut ChartContext<
         '_,
         DB,
-        Cartesian2d<
-            plotters::coord::types::RangedCoordf64,
-            plotters::coord::types::RangedCoordf64,
-        >,
+        Cartesian2d<plotters::coord::types::RangedCoordf64, plotters::coord::types::RangedCoordf64>,
     >,
     points: &[Point2],
     path_to_top1: &[usize],
