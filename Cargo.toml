@@ -1,5 +1,5 @@
 [package]
-name = "diskann-vamana-viz-top1"
+name = "diskann-vamana-viz"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
