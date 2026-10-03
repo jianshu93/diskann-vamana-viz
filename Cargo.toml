@@ -1,7 +1,10 @@
 [package]
 name = "diskann-vamana-viz-top1"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+license = "MIT"
+description = "diskANN Vamana graph visualization"
+
 
 [dependencies]
 plotters = "0.3"
